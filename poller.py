@@ -12,7 +12,15 @@ READERS = {
     "coil": "read_coils",
     "discrete": "read_discrete_inputs",
 }
-
+# DataType -> (кількість регістрів, тип у pymodbus)
+REGISTER_TYPES = {
+    "Short":  (1, "INT16"),
+    "UShort": (1, "UINT16"),
+    "Int":    (2, "INT32"),
+    "UInt":   (2, "UINT32"),
+    "Float":  (2, "FLOAT32"),
+    "Double": (4, "FLOAT64"),
+}
 
 def parse_args():
     p = argparse.ArgumentParser()
@@ -48,15 +56,17 @@ async def read_sensor(client, s):
             raise IOError(str(rr))
         return 1.0 if rr.bits[0] else 0.0
 
-    # Регістри: Float = 2 регістри, Short = 1
-    is_float = s["DataType"] == "Float"
-    rr = await read(s["Address"], count=2 if is_float else 1, device_id=s["Unit"])
+    # Регістри: кількість і спосіб розбору залежать від типу
+    count, type_name = REGISTER_TYPES[s["DataType"]]
+    rr = await read(s["Address"], count=count, device_id=s["Unit"])
     if rr.isError():
         raise IOError(str(rr))
 
-    kind = client.DATATYPE.FLOAT32 if is_float else client.DATATYPE.INT16
-    return round(client.convert_from_registers(rr.registers, kind), 2)
-
+    kind = getattr(client.DATATYPE, type_name)
+    value = client.convert_from_registers(
+        rr.registers, kind, word_order=s.get("WordOrder", "big")
+    )
+    return round(value, 2)
 
 async def main():
     args = parse_args()

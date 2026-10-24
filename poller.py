@@ -1,6 +1,6 @@
-import argparse
 import asyncio
 import json
+import os
 import time
 
 from pymodbus.client import AsyncModbusTcpClient
@@ -12,6 +12,7 @@ READERS = {
     "coil": "read_coils",
     "discrete": "read_discrete_inputs",
 }
+
 # DataType -> (кількість регістрів, тип у pymodbus)
 REGISTER_TYPES = {
     "Short":  (1, "INT16"),
@@ -22,28 +23,71 @@ REGISTER_TYPES = {
     "Double": (4, "FLOAT64"),
 }
 
-def parse_args():
-    p = argparse.ArgumentParser()
-    p.add_argument("--host", default="127.0.0.1")
-    p.add_argument("--port", type=int, default=10502)
-    p.add_argument("--sensors", default="sensors.json")
-    p.add_argument("--interval", type=float, default=0.5, help="секунд між циклами опитування")
-    return p.parse_args()
+REQUIRED_FIELDS = ("Tag", "Unit", "Area", "Address", "DataType")
 
 
-def load_sensors(path):
-    with open(path, encoding="utf-8") as f:
-        data = json.load(f)
+def now_ms() -> int:
+    return int(time.time() * 1000)
 
-    # Приймаємо і {"Sensors": [...]}, і просто масив
-    sensors = data["Sensors"] if isinstance(data, dict) else data
 
-    if not sensors or not all(isinstance(s, dict) for s in sensors):
-        raise SystemExit(
-            "sensors.json: очікується масив об'єктів з полями Tag, Unit, Area, Address, DataType"
-        )
+# ---------------------------------------------------------------- конфігурація
+
+def validate_sensors(data) -> list:
+    """Приймає {"Sensors": [...]} або просто масив. Повертає список датчиків або кидає ValueError."""
+    sensors = data.get("Sensors") if isinstance(data, dict) else data
+
+    if not isinstance(sensors, list):
+        raise ValueError('очікується {"Sensors": [...]} або масив датчиків')
+
+    seen = set()
+    for i, s in enumerate(sensors):
+        if not isinstance(s, dict):
+            raise ValueError(f"датчик #{i}: очікується об'єкт")
+
+        for field in REQUIRED_FIELDS:
+            if field not in s:
+                raise ValueError(f"датчик #{i}: немає поля {field}")
+
+        tag = s["Tag"]
+        if not isinstance(tag, str) or not tag or "/" in tag:
+            raise ValueError(f"датчик #{i}: Tag має бути непорожнім рядком без '/'")
+        if tag in seen:
+            raise ValueError(f"датчик '{tag}': Tag повторюється")
+        seen.add(tag)
+
+        if s["Area"] not in READERS:
+            raise ValueError(f"датчик '{tag}': Area має бути одним із {list(READERS)}")
+
+        is_bit = s["Area"] in ("coil", "discrete")
+        if is_bit and s["DataType"] != "Bool":
+            raise ValueError(f"датчик '{tag}': для coil/discrete DataType має бути Bool")
+        if not is_bit and s["DataType"] not in REGISTER_TYPES:
+            raise ValueError(f"датчик '{tag}': DataType має бути одним із {list(REGISTER_TYPES)}")
+
+        for field in ("Unit", "Address"):
+            if not isinstance(s[field], int) or isinstance(s[field], bool) or s[field] < 0:
+                raise ValueError(f"датчик '{tag}': {field} має бути цілим числом >= 0")
+
+        if s.get("WordOrder", "big") not in ("big", "little"):
+            raise ValueError(f"датчик '{tag}': WordOrder має бути big або little")
+
     return sensors
 
+
+def load_sensors(path: str) -> list:
+    with open(path, encoding="utf-8") as f:
+        return validate_sensors(json.load(f))
+
+
+def save_sensors(path: str, sensors: list) -> None:
+    # Атомарний запис: спершу тимчасовий файл, потім заміна, щоб не лишити половину файлу
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"Sensors": sensors}, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+
+
+# ---------------------------------------------------------------- читання Modbus
 
 async def read_sensor(client, s):
     """Читає один датчик і повертає число. Кидає виняток при помилці."""
@@ -68,32 +112,89 @@ async def read_sensor(client, s):
     )
     return round(value, 2)
 
-async def main():
-    args = parse_args()
-    sensors = load_sensors(args.sensors)
 
-    client = AsyncModbusTcpClient(args.host, port=args.port)
+class Poller:
+    """Циклічно опитує Modbus і повідомляє про результати через колбеки.
 
-    while True:
-        if not client.connected:
-            await client.connect()
-            if not client.connected:
-                print(f"Немає зв'язку з {args.host}:{args.port}, повтор через 3 с")
-                await asyncio.sleep(3)
-                continue
+    on_batch(message)  – після кожного циклу: {"type": "update", ...}
+    on_status(message) – коли змінився стан зв'язку з Modbus: {"type": "status", ...}
+    """
 
-        started = time.monotonic()
-        for s in sensors:
+    def __init__(self, host, port, sensors, interval=0.5):
+        self.host = host
+        self.port = port
+        self.sensors = sensors
+        self.interval = interval
+        self.connected = False
+        self.values = {}      # tag -> {"tag", "value", "quality", "ts"}
+        self.on_batch = None
+        self.on_status = None
+
+    def set_sensors(self, sensors: list) -> None:
+        """Підміняє перелік датчиків без перезапуску. Дані видалених датчиків прибираються."""
+        self.sensors = sensors
+        tags = {s["Tag"] for s in sensors}
+        for tag in list(self.values):
+            if tag not in tags:
+                del self.values[tag]
+
+    def snapshot(self) -> list:
+        return [dict(entry) for entry in self.values.values()]   # копії, щоб не змінились під час відправки
+
+    async def _set_connected(self, connected: bool) -> None:
+        if connected == self.connected:
+            return
+        self.connected = connected
+        if self.on_status:
+            await self.on_status({"type": "status", "modbus": "connected" if connected else "disconnected"})
+
+        # Без зв'язку з Modbus усі значення застарілі: лишаємо останнє значення, але з quality = bad
+        if not connected and self.values:
+            ts = now_ms()
+            for entry in self.values.values():
+                entry["quality"] = "bad"
+                entry["ts"] = ts
+            if self.on_batch:
+                await self.on_batch({"type": "update", "ts": ts, "values": self.snapshot()})
+
+    async def _poll_once(self, client) -> None:
+        ts = now_ms()
+        batch = []
+
+        for s in list(self.sensors):   # копія: перелік можуть підмінити посеред циклу
             try:
-                value = await read_sensor(client, s)
-                print(f"{s['Tag']} = {value}")
+                value, quality = await read_sensor(client, s), "good"
             except Exception as ex:
                 # Помилка одного датчика не зупиняє решту
                 print(f"{s['Tag']}: ПОМИЛКА {ex}")
+                value, quality = None, "bad"
 
-        # Витримуємо інтервал незалежно від того, скільки тривало опитування
-        await asyncio.sleep(max(0.0, args.interval - (time.monotonic() - started)))
+            entry = {"tag": s["Tag"], "value": value, "quality": quality, "ts": ts}
+            self.values[s["Tag"]] = entry
+            batch.append(entry)
 
+        if self.on_batch:
+            await self.on_batch({"type": "update", "ts": ts, "values": batch})
 
-if __name__ == "__main__":
-    asyncio.run(main())
+    async def run(self) -> None:
+        client = AsyncModbusTcpClient(self.host, port=self.port)
+
+        try:
+            while True:
+                if not client.connected:
+                    await client.connect()
+                    if not client.connected:
+                        print(f"Немає зв'язку з {self.host}:{self.port}, повтор через 3 с")
+                        await self._set_connected(False)
+                        await asyncio.sleep(3)
+                        continue
+
+                await self._set_connected(True)
+
+                started = time.monotonic()
+                await self._poll_once(client)
+
+                # Витримуємо інтервал незалежно від того, скільки тривало опитування
+                await asyncio.sleep(max(0.0, self.interval - (time.monotonic() - started)))
+        finally:
+            client.close()

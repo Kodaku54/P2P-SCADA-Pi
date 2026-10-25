@@ -24,7 +24,7 @@ REGISTER_TYPES = {
 }
 
 REQUIRED_FIELDS = ("Tag", "Unit", "Area", "Address", "DataType")
-
+MIN_INTERVAL_MS = 50
 
 def now_ms() -> int:
     return int(time.time() * 1000)
@@ -74,18 +74,33 @@ def validate_sensors(data) -> list:
     return sensors
 
 
+def validate_interval(data):
+    """Інтервал опитування в мс із {"UpdateRateMs": ...} або None, якщо поля немає."""
+    if not isinstance(data, dict) or "UpdateRateMs" not in data:
+        return None
+
+    value = data["UpdateRateMs"]
+    if not isinstance(value, int) or isinstance(value, bool) or value < MIN_INTERVAL_MS:
+        raise ValueError(f"UpdateRateMs має бути цілим числом >= {MIN_INTERVAL_MS}")
+    return value
+
+
 def load_sensors(path: str) -> list:
     with open(path, encoding="utf-8") as f:
         return validate_sensors(json.load(f))
 
 
-def save_sensors(path: str, sensors: list) -> None:
+def load_interval_ms(path: str):
+    with open(path, encoding="utf-8") as f:
+        return validate_interval(json.load(f))
+
+
+def save_sensors(path: str, sensors: list, interval_ms: int) -> None:
     # Атомарний запис: спершу тимчасовий файл, потім заміна, щоб не лишити половину файлу
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
-        json.dump({"Sensors": sensors}, f, ensure_ascii=False, indent=2)
+        json.dump({"Sensors": sensors, "UpdateRateMs": interval_ms}, f, ensure_ascii=False, indent=2)
     os.replace(tmp, path)
-
 
 # ---------------------------------------------------------------- читання Modbus
 
@@ -113,6 +128,26 @@ async def read_sensor(client, s):
     return round(value, 2)
 
 
+async def write_value(client, s, value):
+    """Записує значення в датчик. Кидає виняток при помилці."""
+    if s["Area"] == "coil":
+        rr = await client.write_coil(s["Address"], bool(value), device_id=s["Unit"])
+    elif s["Area"] == "holding":
+        count, type_name = REGISTER_TYPES[s["DataType"]]
+        kind = getattr(client.DATATYPE, type_name)
+        if type_name.startswith(("INT", "UINT")):
+            value = int(value)   # цілі типи: дробова частина відкидається
+        registers = client.convert_to_registers(value, kind, word_order=s.get("WordOrder", "big"))
+        if len(registers) == 1:
+            rr = await client.write_register(s["Address"], registers[0], device_id=s["Unit"])
+        else:
+            rr = await client.write_registers(s["Address"], registers, device_id=s["Unit"])
+    else:
+        raise ValueError("запис можливий лише в coil і holding")
+
+    if rr.isError():
+        raise IOError(str(rr))
+
 class Poller:
     """Циклічно опитує Modbus і повідомляє про результати через колбеки.
 
@@ -126,6 +161,8 @@ class Poller:
         self.sensors = sensors
         self.interval = interval
         self.connected = False
+        self.client = None
+        self.lock = asyncio.Lock()   # опитування і запис не перетинаються на одному з'єднанні
         self.values = {}      # tag -> {"tag", "value", "quality", "ts"}
         self.on_batch = None
         self.on_status = None
@@ -137,6 +174,16 @@ class Poller:
         for tag in list(self.values):
             if tag not in tags:
                 del self.values[tag]
+    async def write_sensor(self, tag: str, value: float) -> None:
+        """KeyError: немає такого датчика; ConnectionError: немає зв'язку з Modbus."""
+        sensor = next((s for s in self.sensors if s["Tag"] == tag), None)
+        if sensor is None:
+            raise KeyError(tag)
+        if self.client is None or not self.client.connected:
+            raise ConnectionError("немає зв'язку з Modbus-пристроєм")
+    
+        async with self.lock:
+            await write_value(self.client, sensor, value)
 
     def snapshot(self) -> list:
         return [dict(entry) for entry in self.values.values()]   # копії, щоб не змінились під час відправки
@@ -163,7 +210,8 @@ class Poller:
 
         for s in list(self.sensors):   # копія: перелік можуть підмінити посеред циклу
             try:
-                value, quality = await read_sensor(client, s), "good"
+                async with self.lock:
+                        value, quality = await read_sensor(client, s), "good"
             except Exception as ex:
                 # Помилка одного датчика не зупиняє решту
                 print(f"{s['Tag']}: ПОМИЛКА {ex}")
@@ -178,6 +226,7 @@ class Poller:
 
     async def run(self) -> None:
         client = AsyncModbusTcpClient(self.host, port=self.port)
+        self.client = client
 
         try:
             while True:

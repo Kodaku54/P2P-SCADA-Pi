@@ -12,6 +12,7 @@ import asyncio
 import contextlib
 import os
 import uuid
+from poller import Poller, load_interval_ms, load_sensors, now_ms, save_sensors, validate_interval, validate_sensors
 
 from aiohttp import WSMsgType, web
 
@@ -69,20 +70,53 @@ async def health(request: web.Request) -> web.Response:
 
 
 async def get_config(request: web.Request) -> web.Response:
-    return web.json_response({"Sensors": request.app[POLLER].sensors})
+    poller = request.app[POLLER]
+    return web.json_response({"Sensors": poller.sensors, "UpdateRateMs": interval_ms(poller)})
 
 
 async def put_config(request: web.Request) -> web.Response:
     try:
-        sensors = validate_sensors(await request.json())
+        data = await request.json()
+        sensors = validate_sensors(data)
+        new_interval = validate_interval(data)   # None, якщо застосунок його не надіслав
     except ValueError as ex:   # сюди ж потрапляє некоректний JSON
         return web.json_response({"error": str(ex)}, status=400)
 
-    request.app[POLLER].set_sensors(sensors)
-    save_sensors(request.app[SENSORS_PATH], sensors)
-    return web.json_response({"ok": True, "sensors": len(sensors)})
+    poller = request.app[POLLER]
+    poller.set_sensors(sensors)
+    if new_interval is not None:
+        poller.interval = new_interval / 1000   # діє з наступного циклу
 
+    save_sensors(request.app[SENSORS_PATH], sensors, interval_ms(poller))
+    return web.json_response({"ok": True, "sensors": len(sensors), "UpdateRateMs": interval_ms(poller)})
+    
+async def put_value(request: web.Request) -> web.Response:
+    tag = request.match_info["tag"]
 
+    try:
+        value = (await request.json())["value"]
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError
+    except (ValueError, KeyError, TypeError):
+        return web.json_response({"error": 'очікується {"value": число}'}, status=400)
+
+    try:
+        await request.app[POLLER].write_sensor(tag, value)
+    except KeyError:
+        return web.json_response({"error": f"немає датчика '{tag}'"}, status=404)
+    except ConnectionError as ex:
+        return web.json_response({"error": str(ex)}, status=503)
+    except ValueError as ex:
+        return web.json_response({"error": str(ex)}, status=400)
+    except Exception as ex:   # помилка Modbus або перетворення значення
+        print(f"{tag}: ПОМИЛКА запису {ex}")
+        return web.json_response({"error": str(ex)}, status=502)
+
+    return web.json_response({"ok": True})
+
+def interval_ms(poller: Poller) -> int:
+    return int(round(poller.interval * 1000))
+    
 async def ws_handler(request: web.Request) -> web.WebSocketResponse:
     app = request.app
     poller = app[POLLER]
@@ -127,7 +161,11 @@ def make_app(args) -> web.Application:
     app[SENSORS_PATH] = args.sensors
     app[CLIENTS] = set()
 
-    poller = Poller(args.host, args.port, load_sensors(args.sensors), args.interval)
+    # Інтервал зі збереженого файлу важливіший за параметр --interval
+    saved_ms = load_interval_ms(args.sensors)
+    interval = saved_ms / 1000 if saved_ms is not None else args.interval
+    
+    poller = Poller(args.host, args.port, load_sensors(args.sensors), interval)
     poller.on_batch = lambda message: broadcast(app, message)
     poller.on_status = lambda message: broadcast(app, message)
     app[POLLER] = poller
@@ -137,6 +175,7 @@ def make_app(args) -> web.Application:
         web.get("/config", get_config),
         web.put("/config", put_config),
         web.get("/ws", ws_handler),
+        web.put("/sensors/{tag}/value", put_value),
     ])
     app.cleanup_ctx.append(poller_lifecycle)
     return app
